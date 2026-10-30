@@ -63,6 +63,25 @@ use super::{
 /// How often a pending fidelity bond is checked for confirmation.
 const BOND_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Locktime for a new fidelity bond meant to stay locked `relative_timelock`
+/// blocks.
+///
+/// Takers measure a bond's timelock from its confirmation height, and a bond
+/// built at `tip_height` confirms in the next block at the earliest. Counting
+/// from that block keeps a bond configured at `MIN_FIDELITY_TIMELOCK` in range,
+/// and one at `MAX_FIDELITY_TIMELOCK` never exceeds it.
+fn fidelity_bond_locktime(
+    tip_height: u32,
+    relative_timelock: u32,
+) -> Result<bitcoin::absolute::LockTime, MakerError> {
+    let height = tip_height
+        .checked_add(1)
+        .and_then(|next_block| next_block.checked_add(relative_timelock))
+        .ok_or(MakerError::General("fidelity locktime height overflows"))?;
+    bitcoin::absolute::LockTime::from_height(height)
+        .map_err(|e| MakerError::Wallet(WalletError::Locktime(e)))
+}
+
 // Covers all production response timeouts and finalization retry delays.
 const COMPLETED_HANDOVER_TTL: Duration = Duration::from_secs(65 * 60);
 
@@ -1367,8 +1386,6 @@ impl MakerServer {
 
     /// Setup fidelity bond for this maker.
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
-        use bitcoin::absolute::LockTime;
-
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.
@@ -1429,43 +1446,21 @@ impl MakerServer {
             let amount = Amount::from_sat(self.config.fidelity_amount);
             log::info!("Fidelity value chosen = {:?} sats", amount.to_sat());
 
-            let current_height = lock_debug!(self.wallet.read())
-                .map_err(|_| MakerError::General("Failed to lock wallet"))?
-                .blockchain
-                .get_block_count()
-                .map_err(MakerError::Wallet)?;
-            let current_height = u32::try_from(current_height)
-                .map_err(|_| MakerError::General("backend tip does not fit u32"))?;
-
-            // Set locktime for test (950 blocks) or production
+            // Set timelock for test (950 blocks) or production
             #[cfg(feature = "integration-test")]
-            let locktime = {
+            let relative_timelock = {
                 use super::handlers::MakerBehavior;
-                let offset = if self.behavior == MakerBehavior::InvalidFidelityTimelock {
+                if self.behavior == MakerBehavior::InvalidFidelityTimelock {
                     log::warn!("Test behavior: using invalid (too short) fidelity timelock");
                     10
                 } else {
                     950
-                };
-                let height = current_height
-                    .checked_add(offset)
-                    .ok_or(MakerError::General("fidelity locktime height overflows"))?;
-                LockTime::from_height(height).map_err(WalletError::Locktime)?
+                }
             };
             #[cfg(not(feature = "integration-test"))]
-            let locktime = {
-                let height = self
-                    .config
-                    .fidelity_timelock
-                    .checked_add(current_height)
-                    .ok_or(MakerError::General("fidelity locktime height overflows"))?;
-                LockTime::from_height(height).map_err(WalletError::Locktime)?
-            };
+            let relative_timelock = self.config.fidelity_timelock;
 
-            log::info!(
-                "Fidelity timelock {:?} blocks",
-                locktime.to_consensus_u32() - current_height
-            );
+            log::info!("Fidelity timelock {:?} blocks", relative_timelock);
 
             // Wait for funds and create fidelity bond
             const SYNC_INTERVAL: Duration = Duration::from_secs(10);
@@ -1481,6 +1476,17 @@ impl MakerServer {
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
                     .sync_and_save(&self.shutdown)
                     .map_err(MakerError::Wallet)?;
+
+                // Read the tip on every attempt: blocks mined while we wait for
+                // funds would otherwise come out of the bond's timelock.
+                let current_height = lock_debug!(self.wallet.read())
+                    .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                    .blockchain
+                    .get_block_count()
+                    .map_err(MakerError::Wallet)?;
+                let current_height = u32::try_from(current_height)
+                    .map_err(|_| MakerError::General("backend tip does not fit u32"))?;
+                let locktime = fidelity_bond_locktime(current_height, relative_timelock)?;
 
                 let fidelity_result = lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -4000,16 +4006,17 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, MakerError,
-        MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
-        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        fidelity_bond_locktime, min_swap_amount, swap_cost_floor, BackendConnector,
+        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal,
+        ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
         wallet::{
             seed_cli::WalletInUse, swapcoin::OutgoingSwapCoin, test_wallet, FidelityError,
-            WalletError, MIN_FIDELITY_BOND_AMOUNT_SATS,
+            WalletError, MAX_FIDELITY_TIMELOCK, MIN_FIDELITY_BOND_AMOUNT_SATS,
+            MIN_FIDELITY_TIMELOCK,
         },
         watch_tower::{service::answering, watcher::WatcherEvent},
     };
@@ -4225,6 +4232,35 @@ pub(crate) mod tests {
                 .unwrap()
                 .fidelity_amount,
             MIN_FIDELITY_BOND_AMOUNT_SATS * 50
+        );
+    }
+
+    /// Takers check `lock_time - confirmation_height`, and a bond built at
+    /// `tip` confirms at `tip + 1` at the earliest. Counting from the tip left
+    /// a maker configured at the minimum timelock one block short, so every
+    /// taker refused its bond.
+    #[test]
+    fn fidelity_bond_locktime_counts_from_the_next_block() {
+        let tip = 800_000u32;
+        for timelock in [MIN_FIDELITY_TIMELOCK, MAX_FIDELITY_TIMELOCK] {
+            let locktime = fidelity_bond_locktime(tip, timelock).unwrap();
+            let relative = locktime.to_consensus_u32() - (tip + 1);
+            assert_eq!(relative, timelock);
+            assert!((MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&relative));
+        }
+
+        // Heights that are not valid block-height locktimes are refused.
+        assert!(fidelity_bond_locktime(u32::MAX, MIN_FIDELITY_TIMELOCK).is_err());
+        // Locktimes from 500,000,000 up are timestamps, not heights.
+        let last_height = 499_999_999u32;
+        assert!(fidelity_bond_locktime(
+            last_height - MIN_FIDELITY_TIMELOCK - 1,
+            MIN_FIDELITY_TIMELOCK
+        )
+        .is_ok());
+        assert!(
+            fidelity_bond_locktime(last_height - MIN_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK)
+                .is_err()
         );
     }
 
