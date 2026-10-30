@@ -63,6 +63,13 @@ use super::{
 /// How often a pending fidelity bond is checked for confirmation.
 const BOND_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
+/// Blocks a new bond keeps above `MIN_FIDELITY_TIMELOCK`. Its timelock is
+/// counted from the next block, so each block it takes beyond that to confirm
+/// comes off what takers measure; about a day of slack keeps a slow
+/// confirmation in range.
+#[cfg(not(feature = "integration-test"))]
+const BOND_CONFIRMATION_MARGIN: u32 = 144;
+
 /// Locktime for a new fidelity bond meant to stay locked `relative_timelock`
 /// blocks.
 ///
@@ -80,6 +87,18 @@ fn fidelity_bond_locktime(
         .ok_or(MakerError::General("fidelity locktime height overflows"))?;
     bitcoin::absolute::LockTime::from_height(height)
         .map_err(|e| MakerError::Wallet(WalletError::Locktime(e)))
+}
+
+/// Whether takers accept a bond that confirmed at `conf_height`: they check
+/// `lock_time - conf_height` against the allowed range. The lock counts from
+/// the block after the tip it was built at, so a bond that took longer to
+/// confirm holds less than the configured timelock and can fall below the
+/// minimum.
+fn bond_timelock_in_range(lock_time: bitcoin::absolute::LockTime, conf_height: u32) -> bool {
+    lock_time
+        .to_consensus_u32()
+        .checked_sub(conf_height)
+        .is_some_and(|timelock| (MIN_FIDELITY_TIMELOCK..=MAX_FIDELITY_TIMELOCK).contains(&timelock))
 }
 
 // Covers all production response timeouts and finalization retry delays.
@@ -1384,6 +1403,21 @@ impl MakerServer {
         Ok(())
     }
 
+    /// [`bond_timelock_in_range`] for a bond of ours. A bond that hasn't
+    /// confirmed yet can't be judged, so it passes.
+    fn bond_timelock_accepted(
+        &self,
+        lock_time: bitcoin::absolute::LockTime,
+        conf_height: Option<u32>,
+    ) -> bool {
+        // This test maker advertises an out-of-range bond on purpose.
+        #[cfg(feature = "integration-test")]
+        if self.behavior == MakerBehavior::InvalidFidelityTimelock {
+            return true;
+        }
+        conf_height.is_none_or(|height| bond_timelock_in_range(lock_time, height))
+    }
+
     /// Setup fidelity bond for this maker.
     pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
@@ -1400,9 +1434,21 @@ impl MakerServer {
         }
         self.finalize_pending_fidelity_bonds(live_bond)?;
 
+        // A bond that confirmed too late for its timelock is never offered:
+        // takers would reject it, and a new bond is funded instead.
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .get_highest_fidelity_index()
+            .get_highest_fidelity_index_where(|bond| {
+                let accepted = self.bond_timelock_accepted(bond.lock_time, bond.conf_height);
+                if !accepted {
+                    log::warn!(
+                        "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
+                        self.config.network_port,
+                        bond.bond_index
+                    );
+                }
+                accepted
+            })
             .map_err(MakerError::Wallet)?;
 
         if let Some(i) = highest_index {
@@ -1443,6 +1489,11 @@ impl MakerServer {
             // Need to create new fidelity bond
             log::info!("No active Fidelity Bonds found. Creating one.");
 
+            // A live bond takers would reject may still be advertised; stop
+            // offering it while the new one is funded.
+            *lock_debug!(self.highest_fidelity_proof.write())
+                .map_err(|_| MakerError::General("Failed to lock fidelity proof"))? = None;
+
             let amount = Amount::from_sat(self.config.fidelity_amount);
             log::info!("Fidelity value chosen = {:?} sats", amount.to_sat());
 
@@ -1458,7 +1509,22 @@ impl MakerServer {
                 }
             };
             #[cfg(not(feature = "integration-test"))]
-            let relative_timelock = self.config.fidelity_timelock;
+            let relative_timelock = {
+                let timelock = self
+                    .config
+                    .fidelity_timelock
+                    .max(MIN_FIDELITY_TIMELOCK + BOND_CONFIRMATION_MARGIN)
+                    .min(MAX_FIDELITY_TIMELOCK);
+                if timelock != self.config.fidelity_timelock {
+                    log::info!(
+                        "Using a {} block fidelity timelock instead of {}, so a bond that confirms late still meets the {} block minimum",
+                        timelock,
+                        self.config.fidelity_timelock,
+                        MIN_FIDELITY_TIMELOCK
+                    );
+                }
+                timelock
+            };
 
             log::info!("Fidelity timelock {:?} blocks", relative_timelock);
 
@@ -1588,6 +1654,17 @@ impl MakerServer {
                             .map_err(|_| MakerError::General("Failed to lock wallet"))?
                             .update_fidelity_bond_conf_details(index, conf_height)
                             .map_err(MakerError::Wallet)?;
+
+                        if !self.bond_timelock_accepted(locktime, Some(conf_height)) {
+                            log::error!(
+                                "[{}] Fidelity bond {} confirmed at height {}, too late to keep the {} block minimum timelock takers accept. Not advertising it, funding a new bond.",
+                                self.config.network_port,
+                                index,
+                                conf_height,
+                                MIN_FIDELITY_TIMELOCK
+                            );
+                            continue;
+                        }
 
                         log::info!(
                             "[{}] Successfully created fidelity bond",
@@ -4021,9 +4098,9 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        fidelity_bond_locktime, min_swap_amount, swap_cost_floor, BackendConnector,
-        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal,
-        ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        bond_timelock_in_range, fidelity_bond_locktime, min_swap_amount, swap_cost_floor,
+        BackendConnector, ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait,
+        ShutdownSignal, ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -4277,6 +4354,28 @@ pub(crate) mod tests {
             fidelity_bond_locktime(last_height - MIN_FIDELITY_TIMELOCK, MIN_FIDELITY_TIMELOCK)
                 .is_err()
         );
+    }
+
+    /// A bond at the minimum timelock is only in range if it confirms in the
+    /// block right after the tip it was built at. Confirming later leaves it
+    /// short, and setup must not advertise it.
+    #[test]
+    fn fidelity_bond_that_confirms_late_is_out_of_range() {
+        let tip = 800_000u32;
+
+        let min_bond = fidelity_bond_locktime(tip, MIN_FIDELITY_TIMELOCK).unwrap();
+        assert!(bond_timelock_in_range(min_bond, tip + 1));
+        assert!(!bond_timelock_in_range(min_bond, tip + 2));
+
+        let max_bond = fidelity_bond_locktime(tip, MAX_FIDELITY_TIMELOCK).unwrap();
+        assert!(bond_timelock_in_range(max_bond, tip + 1));
+        assert!(bond_timelock_in_range(max_bond, tip + 100));
+
+        // A confirmation height past the lock itself is never in range.
+        assert!(!bond_timelock_in_range(
+            min_bond,
+            min_bond.to_consensus_u32() + 1
+        ));
     }
 
     #[test]
