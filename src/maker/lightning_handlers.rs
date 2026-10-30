@@ -1853,6 +1853,16 @@ mod tests {
         assert_eq!(limits.max_swap_in, 500_000);
         assert_eq!(limits.max_swap_out, 80_000);
 
+        // With a fee, inbound still covers 98_019 sats, so the wallet stays the bound.
+        let limits = directional_limits(
+            &[channel(500_000, 100_000, true)],
+            80_000,
+            10_000,
+            1_000,
+            1.0,
+        );
+        assert_eq!(limits.max_swap_out, 80_000);
+
         // An unreadable wallet is reported as no on-chain capacity, which
         // must disable swap-outs rather than advertise an unbacked one.
         let limits = directional_limits(&[channel(500_000, 500_000, true)], 0, 10_000, 0, 0.0);
