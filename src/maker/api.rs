@@ -2220,6 +2220,8 @@ impl MakerServer {
             &channels,
             wallet_max,
             min_swap_amount(&self.config),
+            self.config.base_fee,
+            self.config.amount_relative_fee_pct,
         );
         if !capacity.swap_in && !capacity.swap_out {
             return None;
