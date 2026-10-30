@@ -1479,11 +1479,26 @@ impl MakerServer {
 
                 // Read the tip on every attempt: blocks mined while we wait for
                 // funds would otherwise come out of the bond's timelock.
-                let current_height = lock_debug!(self.wallet.read())
+                let tip = lock_debug!(self.wallet.read())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
                     .blockchain
-                    .get_block_count()
-                    .map_err(MakerError::Wallet)?;
+                    .get_block_count();
+                // Being read on every attempt, a transient backend error here
+                // should not end the setup. Try again on the next sync.
+                let current_height = match tip {
+                    Ok(height) => height,
+                    Err(e) => {
+                        log::warn!(
+                            "Failed to read the chain tip, retrying in {} secs: {:?}",
+                            SYNC_INTERVAL.as_secs(),
+                            e
+                        );
+                        if !self.wait_for_shutdown(SYNC_INTERVAL) {
+                            return Err(MakerError::Shutdown);
+                        }
+                        continue;
+                    }
+                };
                 let current_height = u32::try_from(current_height)
                     .map_err(|_| MakerError::General("backend tip does not fit u32"))?;
                 let locktime = fidelity_bond_locktime(current_height, relative_timelock)?;
