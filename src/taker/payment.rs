@@ -591,8 +591,8 @@ mod tests {
         assert_eq!(highest.len(), hops.len());
         assert_eq!(highest[0], gross);
         for (low, high) in solved.iter().zip(&highest).skip(1) {
-            assert!(low < high, "{low} >= {high}");
-            assert!(*high < gross, "{high} >= {gross}");
+            assert!(low < high, "{} >= {}", low, high);
+            assert!(*high < gross, "{} >= {}", high, gross);
         }
     }
 
