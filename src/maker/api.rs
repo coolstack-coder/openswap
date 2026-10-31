@@ -1419,13 +1419,25 @@ impl MakerServer {
     }
 
     /// Setup fidelity bond for this maker.
-    pub fn setup_fidelity_bond(&self, maker_address: &str) -> Result<FidelityProof, MakerError> {
+    ///
+    /// With `fund_replacement` false, a still-locked bond that takers reject
+    /// ends setup with [`MakerError::FidelityBondTooLate`] instead of waiting
+    /// for funds to replace it, so startup is not held up.
+    pub fn setup_fidelity_bond(
+        &self,
+        maker_address: &str,
+        fund_replacement: bool,
+    ) -> Result<FidelityProof, MakerError> {
         // Adopt any bond that was broadcast but not yet confirmed (e.g. the
         // maker shut down while waiting for confirmation) before deciding
         // whether a new bond is needed.
+        // Only a bond takers accept counts: one that confirmed too late must
+        // not stop us from waiting for a pending bond that may still be fine.
         let live_bond = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
-            .has_live_fidelity_bond()
+            .has_live_fidelity_bond_where(|bond| {
+                self.bond_timelock_accepted(bond.lock_time, bond.conf_height)
+            })
             .map_err(MakerError::Wallet)?;
         // A just-redeemed bond must not stay advertised while a new one confirms.
         if !live_bond {
@@ -1436,11 +1448,13 @@ impl MakerServer {
 
         // A bond that confirmed too late for its timelock is never offered:
         // takers would reject it, and a new bond is funded instead.
+        let rejected = std::cell::Cell::new(None);
         let highest_index = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
             .get_highest_fidelity_index_where(|bond| {
                 let accepted = self.bond_timelock_accepted(bond.lock_time, bond.conf_height);
                 if !accepted {
+                    rejected.set(bond.conf_height.map(|height| (bond.bond_index, height)));
                     log::warn!(
                         "[{}] Skipping fidelity bond {}: its timelock from confirmation is outside the accepted range",
                         self.config.network_port,
@@ -1450,6 +1464,12 @@ impl MakerServer {
                 accepted
             })
             .map_err(MakerError::Wallet)?;
+
+        if highest_index.is_none() && !fund_replacement {
+            if let Some((index, conf_height)) = rejected.get() {
+                return Err(MakerError::FidelityBondTooLate { index, conf_height });
+            }
+        }
 
         if let Some(i) = highest_index {
             // Existing fidelity bond found
@@ -1510,11 +1530,10 @@ impl MakerServer {
             };
             #[cfg(not(feature = "integration-test"))]
             let relative_timelock = {
-                let timelock = self
-                    .config
-                    .fidelity_timelock
-                    .max(MIN_FIDELITY_TIMELOCK + BOND_CONFIRMATION_MARGIN)
-                    .min(MAX_FIDELITY_TIMELOCK);
+                let timelock = self.config.fidelity_timelock.clamp(
+                    MIN_FIDELITY_TIMELOCK + BOND_CONFIRMATION_MARGIN,
+                    MAX_FIDELITY_TIMELOCK,
+                );
                 if timelock != self.config.fidelity_timelock {
                     log::info!(
                         "Using a {} block fidelity timelock instead of {}, so a bond that confirms late still meets the {} block minimum",
@@ -1628,6 +1647,18 @@ impl MakerServer {
                                 addr
                             );
 
+                            // Funds in a bond whose lock has ended come back here,
+                            // even while the renewal loop is blocked on this wait.
+                            if let Err(e) = lock_debug!(self.wallet.write())
+                                .map_err(|_| MakerError::General("Failed to lock wallet"))?
+                                .redeem_expired_fidelity_bonds(
+                                    MIN_RELAY_FEE_RATE,
+                                    AddressType::P2TR,
+                                )
+                            {
+                                log::warn!("Failed to redeem expired fidelity bonds: {:?}", e);
+                            }
+
                             log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
                             if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::Shutdown);
@@ -1655,15 +1686,10 @@ impl MakerServer {
                             .update_fidelity_bond_conf_details(index, conf_height)
                             .map_err(MakerError::Wallet)?;
 
+                        // Not retried here: waiting for funds for a replacement
+                        // would hold up startup. The renewal loop funds one.
                         if !self.bond_timelock_accepted(locktime, Some(conf_height)) {
-                            log::error!(
-                                "[{}] Fidelity bond {} confirmed at height {}, too late to keep the {} block minimum timelock takers accept. Not advertising it, funding a new bond.",
-                                self.config.network_port,
-                                index,
-                                conf_height,
-                                MIN_FIDELITY_TIMELOCK
-                            );
-                            continue;
+                            return Err(MakerError::FidelityBondTooLate { index, conf_height });
                         }
 
                         log::info!(
