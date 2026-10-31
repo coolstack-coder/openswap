@@ -2466,12 +2466,19 @@ mod tests {
     /// A configured port at or above the search's upper bound is still tried.
     #[test]
     fn bind_port_retry_tries_a_given_port_above_the_search_bound() {
-        let port = (62_000..=u16::MAX)
-            .find(|&port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok())
-            .expect("no free port above the search bound");
-
-        let (_listener, bound) = bind_port_retry(port).unwrap();
-        assert_eq!(bound, port);
+        // The probe listener is dropped before bind_port_retry runs, so
+        // another process can take the port in between; move on to the
+        // next candidate if that happens.
+        for port in 62_000..=u16::MAX {
+            if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
+                continue;
+            }
+            if let Ok((_listener, bound)) = bind_port_retry(port) {
+                assert_eq!(bound, port);
+                return;
+            }
+        }
+        panic!("no free port above the search bound");
     }
 
     #[test]
