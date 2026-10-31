@@ -2110,19 +2110,24 @@ fn send_message(stream: &TcpStream, message: &MakerToTakerMessage) -> Result<(),
 }
 
 /// Binds `port`, or the first free port above it in steps of 2.
+///
+/// `port` itself is always tried. The search above it stops below 62000.
 pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
     let mut current_port = port;
     const MAX_PORT: u16 = 62000;
 
-    while current_port < MAX_PORT {
+    loop {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, current_port)) {
             Ok(l) => {
                 let bound_port = l.local_addr().map_err(MakerError::IO)?.port();
                 return Ok((l, bound_port));
             }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
-                log::info!("Port {} in use, trying {}", current_port, current_port + 2);
-                current_port += 2
+                let Some(next_port) = current_port.checked_add(2).filter(|&p| p < MAX_PORT) else {
+                    break;
+                };
+                log::info!("Port {} in use, trying {}", current_port, next_port);
+                current_port = next_port;
             }
             Err(e) => {
                 log::error!("Failed to bind port {}: {}", current_port, e);
@@ -2456,6 +2461,17 @@ mod tests {
         drop(held);
         let (_listener, bound) = bind_port_retry(port).unwrap();
         assert_eq!(bound, port, "a free port is used as is");
+    }
+
+    /// A configured port at or above the search's upper bound is still tried.
+    #[test]
+    fn bind_port_retry_tries_a_given_port_above_the_search_bound() {
+        let port = (62_000..=u16::MAX)
+            .find(|&port| TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok())
+            .expect("no free port above the search bound");
+
+        let (_listener, bound) = bind_port_retry(port).unwrap();
+        assert_eq!(bound, port);
     }
 
     #[test]
