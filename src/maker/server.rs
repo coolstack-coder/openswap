@@ -2467,15 +2467,23 @@ mod tests {
     #[test]
     fn bind_port_retry_tries_a_given_port_above_the_search_bound() {
         // The probe listener is dropped before bind_port_retry runs, so
-        // another process can take the port in between; move on to the
-        // next candidate if that happens.
+        // another process can take the port in between. Only then move on to
+        // the next candidate: a port that is still free must have been bound.
         for port in 62_000..=u16::MAX {
             if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err() {
                 continue;
             }
-            if let Ok((_listener, bound)) = bind_port_retry(port) {
-                assert_eq!(bound, port);
-                return;
+            match bind_port_retry(port) {
+                Ok((_listener, bound)) => {
+                    assert_eq!(bound, port);
+                    return;
+                }
+                Err(e) => assert!(
+                    TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_err(),
+                    "bind_port_retry({}) refused a free port: {:?}",
+                    port,
+                    e
+                ),
             }
         }
         panic!("no free port above the search bound");
