@@ -590,8 +590,11 @@ mod tests {
         let highest = route_hop_amounts(&hops, 442, gross);
         assert_eq!(highest.len(), hops.len());
         assert_eq!(highest[0], gross);
-        // Maker 1 is declared what maker 0 forwards at the floor fee.
-        assert_eq!(highest[1], hop_net_sats(&hops[0], 442, gross));
+        // Each later maker is declared what the one before forwards at the
+        // floor fee.
+        for ((hop, prev), next) in hops.iter().zip(&highest).zip(&highest[1..]) {
+            assert_eq!(*next, hop_net_sats(hop, 442, *prev));
+        }
         for (low, high) in solved.iter().zip(&highest).skip(1) {
             assert!(low < high, "{} >= {}", low, high);
             assert!(*high < gross, "{} >= {}", high, gross);
