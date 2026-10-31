@@ -26,7 +26,10 @@ use crate::{
         now_secs, HEART_BEAT_INTERVAL, MAX_RPC_MESSAGE_SIZE, MIN_RELAY_FEE_RATE,
         UNBROADCAST_DISCARD_GRACE,
     },
-    wallet::{AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet},
+    wallet::{
+        AnyBlockchain, Blockchain, RecoveryOutcome, RecoveryReport, SwapRole, Wallet,
+        MIN_FIDELITY_TIMELOCK,
+    },
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
 
@@ -346,7 +349,19 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
-        maker.setup_fidelity_bond(maker_address)?;
+        match maker.setup_fidelity_bond(maker_address, false) {
+            Ok(_) => {}
+            // Start without a bond rather than wait here for a replacement: the
+            // renewal loop funds one, and redeems the late bond once it expires.
+            Err(MakerError::FidelityBondTooLate { index, conf_height }) => log::error!(
+                "[{}] Fidelity bond {} confirmed at height {}, too late for its timelock to stay above the {} block minimum takers accept. Starting without a bond; the renewal loop will fund a new one.",
+                maker.config.network_port,
+                index,
+                conf_height,
+                MIN_FIDELITY_TIMELOCK
+            ),
+            Err(e) => return Err(e),
+        }
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);
         maker.check_swap_liquidity()?;
@@ -1059,7 +1074,7 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         }
 
         // Re-run setup to create new bond if needed
-        if let Err(e) = maker.setup_fidelity_bond(maker_address) {
+        if let Err(e) = maker.setup_fidelity_bond(maker_address, true) {
             log::warn!(
                 "[{}] Fidelity bond renewal failed: {:?}",
                 maker.config.network_port,
