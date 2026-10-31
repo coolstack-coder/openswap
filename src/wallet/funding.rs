@@ -190,21 +190,29 @@ fn smallest_cover(pool_desc: &[(OutPoint, Amount)], n: usize, need: u64) -> Opti
         return best.map(|(_, lo, hi)| vec![m - 1 - lo, m - 1 - hi]);
     }
     // Greedy fill: the largest coin within the remaining deficit, else the
-    // smallest coin above it.
+    // smallest coin above it. On the last slot a coin below the deficit can
+    // only end the fill short, so it takes the smallest coin above the
+    // deficit instead.
     let mut chosen: Vec<usize> = Vec::with_capacity(n);
     // Membership mask: a linear `chosen.contains` on every candidate makes the
     // fill quadratic in the pool, and the pool is unbounded for the taker.
     let mut taken = vec![false; m];
     let mut covered = 0u64;
-    for _ in 0..n {
-        let pick = (0..m)
+    for slot in 0..n {
+        let deficit = need - covered;
+        let above = || {
+            (0..m)
+                .filter(|i| !taken[*i])
+                .rfind(|i| pool_desc[*i].1.to_sat() > deficit)
+        };
+        let pick = match (0..m)
             .filter(|i| !taken[*i])
-            .find(|i| pool_desc[*i].1.to_sat() <= need - covered)
-            .or_else(|| {
-                (0..m)
-                    .filter(|i| !taken[*i])
-                    .rfind(|i| pool_desc[*i].1.to_sat() > need - covered)
-            })?;
+            .find(|i| pool_desc[*i].1.to_sat() <= deficit)
+        {
+            Some(i) if slot + 1 == n && pool_desc[i].1.to_sat() < deficit => above(),
+            Some(i) => Some(i),
+            None => above(),
+        }?;
         covered += pool_desc[pick].1.to_sat();
         taken[pick] = true;
         chosen.push(pick);
@@ -870,6 +878,47 @@ mod tests {
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].utxos.len(), 3);
         assert_eq!(plan[0].value.to_sat(), 5_900);
+    }
+
+    #[test]
+    fn greedy_fill_closes_the_gap_on_the_last_slot() {
+        // 60k, then 30k (within the 40k deficit), leaves 10k. The largest
+        // coin within it, 5k, would end three inputs at 95k; the last slot
+        // takes 20k, the smallest coin above the deficit.
+        let pool = pool(&[
+            (1, 60_000),
+            (2, 30_000),
+            (3, 25_000),
+            (4, 20_000),
+            (5, 5_000),
+        ]);
+        assert_eq!(smallest_cover(&pool, 3, 100_000), Some(vec![0, 1, 3]));
+    }
+
+    #[test]
+    fn three_inputs_fund_a_split_whenever_the_top_three_cover() {
+        // need(3) = 99_301 sits under the top-3 sum (115k), so n = 3 must
+        // plan; a fill that ran short there would fall to n = 4.
+        let plan = plan_funding_splits(
+            &pool(&[
+                (1, 60_000),
+                (2, 30_000),
+                (3, 25_000),
+                (4, 20_000),
+                (5, 5_000),
+            ]),
+            Amount::from_sat(99_000),
+            1,
+            u32::MAX,
+            1.0,
+            FLOOR,
+            None,
+        );
+        assert_eq!(plan.len(), 1);
+        let mut vouts: Vec<u32> = plan[0].utxos.iter().map(|op| op.vout).collect();
+        vouts.sort_unstable();
+        assert_eq!(vouts, vec![1, 2, 4]);
+        assert_eq!(plan[0].value.to_sat(), 99_000);
     }
 
     #[test]
