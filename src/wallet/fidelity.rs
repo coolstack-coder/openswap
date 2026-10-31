@@ -509,14 +509,18 @@ impl Wallet {
         serde_json::to_string_pretty(&serialized).map_err(|e| WalletError::General(e.to_string()))
     }
 
-    /// Whether a confirmed, unspent bond is still locked at the tip. Read from
-    /// the bond records, so a failed valuation never reads as no live bond.
-    pub(crate) fn has_live_fidelity_bond(&self) -> Result<bool, WalletError> {
+    /// Whether a confirmed, unspent bond that `accept` lets through is still
+    /// locked at the tip. Read from the bond records, so a failed valuation
+    /// never reads as no live bond.
+    pub(crate) fn has_live_fidelity_bond_where(
+        &self,
+        accept: impl Fn(&FidelityBond) -> bool,
+    ) -> Result<bool, WalletError> {
         let mut confirmed = self
             .store
             .fidelity_bond
             .iter()
-            .filter(|bond| !bond.is_spent && bond.conf_height.is_some())
+            .filter(|bond| !bond.is_spent && bond.conf_height.is_some() && accept(bond))
             .peekable();
         if confirmed.peek().is_none() {
             return Ok(false);
