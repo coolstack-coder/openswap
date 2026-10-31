@@ -346,6 +346,9 @@ fn serve(maker: Arc<MakerServer>) -> Result<(), MakerError> {
             "[{}] Setting up fidelity bond...",
             maker.config.network_port
         );
+        // Recovery above has started; refuse fees no swap can pay before the
+        // bond locks any coins.
+        super::api::check_fees_can_price_a_swap(&maker.config)?;
         maker.setup_fidelity_bond(maker_address)?;
         spawn_nostr_broadcast_thread(&maker)?;
         log::info!("[{}] Checking swap liquidity...", maker.config.network_port);

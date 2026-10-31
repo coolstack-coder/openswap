@@ -27,7 +27,6 @@ openswap maker::api::lightning_config_tests::lightning_settings_round_trip_throu
 openswap maker::api::tests::advertised_min_swap_is_the_smallest_passing_round_amount
 openswap maker::api::tests::breach_query_without_an_answer_is_an_error
 openswap maker::api::tests::compat_maker_reservations_and_readmission_use_saved_coins
-openswap maker::api::tests::init_rejects_fees_no_swap_can_pay
 openswap maker::api::tests::init_rejects_zero_required_confirms
 openswap maker::api::tests::maker_config_checks_file_values
 openswap maker::api::tests::maker_config_debug_hides_wallet_password
@@ -36,6 +35,7 @@ openswap maker::api::tests::maker_config_rejects_fidelity_amount_below_the_disco
 openswap maker::api::tests::maker_init_refuses_bad_fee_pcts
 openswap maker::api::tests::shutdown_join_releases_pool_lock_and_drains_late_child
 openswap maker::api::tests::shutdown_signal_latches_request_and_rearms_backend_after_joins
+openswap maker::api::tests::unpriceable_fees_are_refused_before_the_bond
 openswap maker::handlers::tests::compat_maker_rejects_invalid_pins_before_admission
 openswap maker::handlers::tests::funding_guard_admits_one_handler_per_swap
 openswap maker::handlers::tests::incoming_must_match_the_declared_swap_amount

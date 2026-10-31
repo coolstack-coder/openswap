@@ -133,6 +133,15 @@ const MIN_SWAP_STEP_SATS: u64 = 500;
 /// Error for fee settings that leave `min_swap_amount` with no answer.
 const UNPRICEABLE_FEES: &str = "Fee settings cannot price a minimum swap amount";
 
+/// Refuses fee settings that leave `min_swap_amount` with no answer: no swap
+/// could ever be priced, so a fidelity bond for them would only lock coins.
+pub(crate) fn check_fees_can_price_a_swap(config: &MakerServerConfig) -> Result<(), MakerError> {
+    if min_swap_amount(config) == u64::MAX {
+        return Err(MakerError::General(UNPRICEABLE_FEES));
+    }
+    Ok(())
+}
+
 /// Smallest swap every protocol accepts: one coin in, one coin out,
 /// at the relay floor and a one-maker lock, rounded up to `MIN_SWAP_STEP_SATS`.
 fn min_swap_amount(config: &MakerServerConfig) -> u64 {
@@ -972,11 +981,6 @@ impl MakerServer {
         // Nothing downstream defends against that, so refuse the config.
         if config.required_confirms == 0 {
             return Err(MakerError::General("required_confirms must be at least 1"));
-        }
-        // Startup creates the fidelity bond before the liquidity check, so
-        // refuse fees no swap can pay before any coins get locked.
-        if min_swap_amount(&config) == u64::MAX {
-            return Err(MakerError::General(UNPRICEABLE_FEES));
         }
         std::fs::create_dir_all(&config.data_dir).map_err(MakerError::IO)?;
         // For the Core backend, bind the node-side wallet name to the on-disk
@@ -4006,9 +4010,9 @@ pub(crate) mod tests {
     #[cfg(feature = "integration-test")]
     use super::MakerBehavior;
     use super::{
-        min_swap_amount, swap_cost_floor, BackendConnector, ConnectionState, MakerError,
-        MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal, ThreadPool, WatchService,
-        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
+        check_fees_can_price_a_swap, min_swap_amount, swap_cost_floor, BackendConnector,
+        ConnectionState, MakerError, MakerServer, MakerServerConfig, MakerTrait, ShutdownSignal,
+        ThreadPool, WatchService, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE, UNPRICEABLE_FEES,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
@@ -4433,24 +4437,21 @@ pub(crate) mod tests {
         ));
     }
 
-    /// Fees no swap can pay must stop init before it touches disk, the
-    /// backend or the wallet, since startup locks the fidelity bond first.
+    /// Fees no swap can pay are refused before serve creates a fidelity bond.
     #[test]
-    fn init_rejects_fees_no_swap_can_pay() {
-        let dir = bitcoind::tempfile::tempdir().unwrap();
+    fn unpriceable_fees_are_refused_before_the_bond() {
         // Each pct passes `check_fee_pcts`, but amount fee plus the time fee
         // over the base lock is at least 100% with either base (20 or 150).
         let config = MakerServerConfig {
-            data_dir: dir.path().join("maker"),
             amount_relative_fee_pct: 50.0,
             time_relative_fee_pct: 5.0,
             ..Default::default()
         };
         assert!(matches!(
-            MakerServer::init(config),
+            check_fees_can_price_a_swap(&config),
             Err(MakerError::General(UNPRICEABLE_FEES))
         ));
-        assert!(!dir.path().join("maker").exists());
+        assert!(check_fees_can_price_a_swap(&MakerServerConfig::default()).is_ok());
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.
